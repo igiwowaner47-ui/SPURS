@@ -170,13 +170,24 @@ class ddgGeo(torch.utils.data.Dataset):
             append_tensor = torch.cat([wt_onehot,mt_onehot])
             append_tensor = append_tensor.float()
 
+            wt_aa_id = ALPAHBET.index(wt)
+            mut_aa_id = ALPAHBET.index(mut)
+
             protein['mut_ids'].append(pdb_idx)
+            protein['mut_pos'].append(pdb_idx)
+            protein['wt_aa_id'].append(wt_aa_id)
+            protein['mut_aa_id'].append(mut_aa_id)
             protein['ddG'].append(ddG)
+            protein['ddG_true'].append(ddG)
             protein['append_tensors'].append(append_tensor)
             
         if len(protein['ddG'])==0:
             protein['mut_ids'] = [1]
+            protein['mut_pos'] = [1]
+            protein['wt_aa_id'] = [0]
+            protein['mut_aa_id'] = [0]
             protein['ddG'] = [torch.tensor([0.0])]
+            protein['ddG_true'] = [torch.tensor([0.0])]
             protein['append_tensors'] = [torch.zeros((42)).float()]
             
         if  self.mut_seq:
@@ -189,7 +200,11 @@ class ddgGeo(torch.utils.data.Dataset):
             protein['chain_encoding_all'] = protein['chain_encoding_all'].expand(len(protein['S']),-1).clone()
             protein['randn_1'] = protein['randn_1'].expand(len(protein['S']),-1).clone()
             
+        protein['mut_pos'] = torch.LongTensor(protein['mut_pos'])
+        protein['wt_aa_id'] = torch.LongTensor(protein['wt_aa_id'])
+        protein['mut_aa_id'] = torch.LongTensor(protein['mut_aa_id'])
         protein['ddG'] = torch.stack(protein['ddG'])
+        protein['ddG_true'] = torch.stack(protein['ddG_true'])
         protein['append_tensors'] = torch.stack(protein['append_tensors'])
 
         protein['dataset'] = self.dataset_name

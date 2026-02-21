@@ -122,11 +122,22 @@ class ddgBenchDataset(torch.utils.data.Dataset):
             append_tensor = torch.cat([wt_onehot,mt_onehot])
             append_tensor = append_tensor.float()
 
+            wt_aa_id = ALPAHBET.index(wt)
+            mut_aa_id = ALPAHBET.index(mut)
+
             protein['mut_ids'].append(pdb_idx)
+            protein['mut_pos'].append(pdb_idx)
+            protein['wt_aa_id'].append(wt_aa_id)
+            protein['mut_aa_id'].append(mut_aa_id)
             protein['ddG'].append(ddG)
+            protein['ddG_true'].append(ddG)
             protein['append_tensors'].append(append_tensor)
 
+        protein['mut_pos'] = torch.LongTensor(protein['mut_pos'])
+        protein['wt_aa_id'] = torch.LongTensor(protein['wt_aa_id'])
+        protein['mut_aa_id'] = torch.LongTensor(protein['mut_aa_id'])
         protein['ddG'] = torch.stack(protein['ddG'])
+        protein['ddG_true'] = torch.stack(protein['ddG_true'])
         protein['append_tensors'] = torch.stack(protein['append_tensors'])
         protein['pdb_path'] = self.structure_path
         protein['dataset'] = self.dataset_name

@@ -74,7 +74,8 @@ class Alphabet(object):
                               to_pifold_format=kwds.get('to_pifold_format', False),
                               coord_nan_to_zero=kwds.get('coord_nan_to_zero', True),
                               single_mut= kwds.get('single_mut', False),
-                              mut_seq= kwds.get('mut_seq', False))
+                              mut_seq= kwds.get('mut_seq', False),
+                              saprot_lmdb_path=kwds.get('saprot_lmdb_path', 'processed_data/saprot_lmdb/wt_mlm_db/'))
 
     @property
     def featurizer(self):
