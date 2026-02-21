@@ -1,12 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List
-
 import torch
 from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
 from spurs.models.stability.protein_mpnn import ProteinMPNNConfig
 
-from spurs.models.stability.modules.esm2 import ESM2
 from spurs import utils
 from spurs.models.stability.org_transfer_model import get_protein_mpnn
 import torch.nn.functional as F
@@ -21,7 +18,6 @@ log = utils.get_logger(__name__)
 @dataclass
 class SPURSMultiConfig:
     encoder: ProteinMPNNConfig = field(default=ProteinMPNNConfig())
-    adapter_layer_indices: List = field(default_factory=lambda: [-1, ])
     separate_loss: bool = True
     name: str = 'esm2_t33_650M_UR50D'
     dropout: float = 0.1
@@ -71,7 +67,13 @@ class SPURSMulti(BaseModel):
         batch['feats'] = self.forward_encoder(batch)
 
         batch['feats'] = batch['feats'][:,:,:self.input_dim]
-        encoder_out = {'feats':F.pad(batch['feats'], (0, 0, 1, 1))}
+        base_feats = F.pad(batch['feats'], (0, 0, 1, 1))
+        encoder_out = {
+            'profam': F.pad(batch.get('profam_feats', batch['feats']), (0, 0, 1, 1)),
+            'boltz2': F.pad(batch.get('boltz2_feats', batch['feats']), (0, 0, 1, 1)),
+            'ligandmpnn': F.pad(batch.get('ligandmpnn_feats', batch['feats']), (0, 0, 1, 1)),
+            'feats': base_feats,
+        }
         
         init_pred = batch['tokens']
         # need to rethink
