@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from spurs.models.stability.modules.esm2_adapter import StructuralAdapterConfig, StructuralAdapterStack
 from spurs.models.saprot_backbone import SaProtBackbone, SaProtConfig
 import torch.nn as nn
+from spurs.models.profam_encoder import ProFAMEncoder
+from spurs.models.boltz_encoder import BoltzEncoder
 log = utils.get_logger(__name__)
 from .mlp import MLPConfig
 from spurs.models.ddg_head import DDGHead
@@ -74,12 +76,43 @@ class SPURS(BaseModel):
             dropout=self.cfg.dropout,
         ))
         self.input_dim = self.cfg.mlp.input_dim
+        self.profam_encoder = ProFAMEncoder(out_dim=1280)
+        self.boltz_encoder = BoltzEncoder(out_dim=1280)
+        self.geo_projector = nn.Linear(self.input_dim, 1280)
+        self.cfg.mlp.input_dim = self.cfg.mlp.input_dim+1280 if self.cfg.mlp.flat_dim < 0 else self.cfg.mlp.input_dim+self.cfg.mlp.flat_dim
+
+        self.mlp = MLP(self.cfg.mlp)
+            
+
+
+        if self.cfg.mlp.flat_dim > 0:
+            self.flat_layers = nn.Linear(1280, self.cfg.mlp.flat_dim)
+            self.dp = nn.Dropout(self.cfg.dropout)
         self.ddg_head = DDGHead(hidden_dim=1280, out_dim=20)
         
         self.padding_idx = self.decoder.padding_idx
         self.mask_idx = self.decoder.mask_idx
         self.cls_idx = self.decoder.cls_idx
         self.eos_idx = self.decoder.eos_idx
+
+    @staticmethod
+    def _align_to_mask(feats: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Ensure [B, N, D] features strictly align to valid token positions in mask."""
+        if feats is None:
+            return None
+        if mask is None:
+            return feats
+
+        B, N = mask.shape
+        D = feats.shape[-1]
+        aligned = feats.new_zeros((B, N, D))
+
+        for b in range(B):
+            valid_idx = torch.where(mask[b] > 0)[0]
+            take_n = min(valid_idx.numel(), feats.shape[1])
+            if take_n > 0:
+                aligned[b, valid_idx[:take_n]] = feats[b, :take_n]
+        return aligned
         
     def forward(self, batch, **kwargs):
         if not self.tune:
@@ -89,7 +122,40 @@ class SPURS(BaseModel):
             batch['feats'] = self.forward_encoder(batch)
         
         batch['feats'] = batch['feats'][:,:,:self.input_dim]
-        encoder_out = {'feats':F.pad(batch['feats'], (0, 0, 1, 1))}
+
+        # v6 encoder order: ProFAM -> Boltz -> Geo.
+        geo_feats = self._align_to_mask(batch['feats'], batch.get('mask', None))
+
+        profam_forward = batch.get('profam_forward', None)
+        if profam_forward is None:
+            profam_forward = batch.get('profam_repr', geo_feats)
+        profam_reverse = batch.get('profam_reverse', None)
+        F_profam_1280 = self.profam_encoder(
+            self._align_to_mask(profam_forward, batch.get('mask', None)),
+            None if profam_reverse is None else self._align_to_mask(profam_reverse, batch.get('mask', None)),
+            batch.get('mask', None),
+        )
+
+        boltz_source = batch.get('boltz_single_repr', None)
+        if boltz_source is None:
+            boltz_source = batch.get('boltz_output', None)
+        if boltz_source is None and 'boltz_model' in batch:
+            boltz_source = batch['boltz_model']
+            boltz_inputs = batch.get('boltz_inputs', None)
+            F_boltz_1280 = self.boltz_encoder(boltz_source, boltz_inputs)
+        elif boltz_source is not None:
+            F_boltz_1280 = self.boltz_encoder(boltz_source)
+        else:
+            F_boltz_1280 = geo_feats.new_zeros((geo_feats.shape[0], geo_feats.shape[1], 1280))
+        F_boltz_1280 = self._align_to_mask(F_boltz_1280, batch.get('mask', None))
+
+        F_geo_proj = self.geo_projector(geo_feats)
+
+        batch['F_profam_1280'] = F_profam_1280
+        batch['F_boltz_1280'] = F_boltz_1280
+        batch['F_geo_proj'] = F_geo_proj
+
+        encoder_out = {'feats':F.pad(geo_feats, (0, 0, 1, 1))}
         
         init_pred = batch['tokens']
 
