@@ -210,13 +210,24 @@ class MegaScaleDataset(torch.utils.data.Dataset):
             # split = fing_split_in_proteingym(mut_seq.aa_seq)
             
             
+            wt_aa_id = ALPAHBET.index(wt)
+            mut_aa_id = ALPAHBET.index(mut)
+
             protein['mut_ids'].append(mut_id)
+            protein['mut_pos'].append(mut_id)
+            protein['wt_aa_id'].append(wt_aa_id)
+            protein['mut_aa_id'].append(mut_aa_id)
             protein['ddG'].append(ddG)
+            protein['ddG_true'].append(ddG)
             protein['append_tensors'].append(append_tensor)
             protein['mut_seq'].append(mut_seq.aa_seq)
             # dataset_name.append('megascale'+str(split))
 
+        protein['mut_pos'] = torch.LongTensor(protein['mut_pos'])
+        protein['wt_aa_id'] = torch.LongTensor(protein['wt_aa_id'])
+        protein['mut_aa_id'] = torch.LongTensor(protein['mut_aa_id'])
         protein['ddG'] = torch.stack(protein['ddG']).to(protein['X'].device,non_blocking=True)
+        protein['ddG_true'] = torch.stack(protein['ddG_true']).to(protein['X'].device,non_blocking=True)
         protein['append_tensors'] = torch.stack(protein['append_tensors'])
         # protein['dataset'] = dataset_name
         protein['dataset'] = 'megascale'
@@ -289,11 +300,8 @@ class Featurizer(object):
                 raw_batch['tokens'] = tokens
                 raw_batch['mut_tokens'] = None
             
-            if True:
-                ddg = raw_batch['ddG']
-                raw_batch['ddG'] = ddg
             raw_batch['ddG'] = raw_batch['ddG'].reshape(-1)
-            
+            raw_batch['ddG_true'] = raw_batch['ddG_true'].reshape(-1)
 
             return raw_batch
             
@@ -321,8 +329,12 @@ class Featurizer(object):
         return {
             'raw_batch': raw_batch,
             'mut_ids': [protein['mut_ids'] for protein in raw_batch],
+            'mut_pos': [protein['mut_pos'] for protein in raw_batch],
+            'wt_aa_id': [protein['wt_aa_id'] for protein in raw_batch],
+            'mut_aa_id': [protein['mut_aa_id'] for protein in raw_batch],
             'append_tensors' : torch.stack([protein['append_tensors'] for protein in raw_batch]),
             'ddG': ddg,
+            'ddG_true': torch.stack([protein['ddG_true'] for protein in raw_batch]),
             'name': [protein['name']+protein['chain_ids'] for protein in raw_batch],
             'dataset': [protein['dataset'] for protein in raw_batch],
         }

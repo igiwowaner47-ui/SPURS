@@ -50,7 +50,11 @@ class EngymeDataset(torch.utils.data.Dataset):
         protein = get_pdb(pdb[0], wt_name, wt_name, check_assert=False)
         
         protein['mut_ids'] = torch.tensor([0])
-        protein['ddG'] = torch.tensor([[0]])
+        protein['mut_pos'] = torch.tensor([0])
+        protein['wt_aa_id'] = torch.tensor([0])
+        protein['mut_aa_id'] = torch.tensor([0])
+        protein['ddG'] = torch.tensor([[0.0]])
+        protein['ddG_true'] = torch.tensor([[0.0]])
         protein['append_tensors'] = torch.tensor([0])
 
         protein['dataset'] = ['0']

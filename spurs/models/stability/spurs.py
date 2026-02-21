@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 import torch
+import torch.nn.functional as F
 from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
 from spurs.models.stability.protein_mpnn import ProteinMPNNConfig
@@ -9,11 +10,10 @@ from spurs.models.stability.protein_mpnn import ProteinMPNNConfig
 from spurs.models.stability.modules.esm2 import ESM2
 from spurs import utils
 from spurs.models.stability.org_transfer_model import get_protein_mpnn
-import torch.nn.functional as F
 from spurs.models.stability.modules.esm2_adapter import ESM2WithStructuralAdatper
-import torch.nn as nn
 log = utils.get_logger(__name__)
-from .mlp import MLP, MLPConfig
+from .mlp import MLPConfig
+from spurs.models.ddg_head import DDGHead
 
 
 @dataclass
@@ -61,15 +61,7 @@ class SPURS(BaseModel):
         self.cfg.encoder.d_model = self.cfg.mlp.input_dim
         self.decoder = ESM2WithStructuralAdatper.from_pretrained(args=self.cfg, name=self.cfg.name)
         self.input_dim = self.cfg.mlp.input_dim
-        self.cfg.mlp.input_dim = self.cfg.mlp.input_dim+1280 if self.cfg.mlp.flat_dim < 0 else self.cfg.mlp.input_dim+self.cfg.mlp.flat_dim
-
-        self.mlp = MLP(self.cfg.mlp)
-            
-
-
-        if self.cfg.mlp.flat_dim > 0:
-            self.flat_layers = nn.Linear(1280, self.cfg.mlp.flat_dim)
-            self.dp = nn.Dropout(self.cfg.dropout)
+        self.ddg_head = DDGHead(hidden_dim=1280, out_dim=20)
         
         self.padding_idx = self.decoder.padding_idx
         self.mask_idx = self.decoder.mask_idx
@@ -94,52 +86,32 @@ class SPURS(BaseModel):
         )
         
         representation = decoder_out['representations'][-1]
-        if self.cfg.mlp.flat_dim > 0:
-        
-            flat_representation = self.flat_layers(representation)
-            flat_representation = self.dp(flat_representation)
-            flat_representation = F.gelu(flat_representation)
-            representation = flat_representation
-        
-        representation = torch.cat([representation, encoder_out['feats']], dim=-1)
+        residue_representation = representation[:, 1:-1, :]
+        residue_scores = self.ddg_head(residue_representation)
 
         if 'return_logist' in kwargs and kwargs['return_logist']:
-            wt=batch['seq']
-            shifted_mut_ids = torch.repeat_interleave(torch.arange(1, 1+len(wt)), 20)
-            muted_id_representation = representation[:, shifted_mut_ids.long()]
-            batch['muted_id_representation'] = muted_id_representation
-            pre_output = self.mlp(batch)
-            
-            ddg_out = pre_output.squeeze()
-            mt_aa = torch.arange(20).repeat(len(wt))
-            
-            
-            ALPHABET = 'ACDEFGHIKLMNPQRSTVWY'
-            wt_aa = torch.repeat_interleave(torch.tensor([ALPHABET.index(s) for s in wt]), 20)
-            num_classes = 21
-            
-            mt_aa_one_hot = F.one_hot(mt_aa, num_classes=num_classes).to(representation.device)
-            wt_aa_one_hot = F.one_hot(wt_aa, num_classes=num_classes).to(representation.device)
-            
-            ddg_out_aa = (ddg_out*mt_aa_one_hot).sum(-1)
-            ddg_out_wt_aa = (ddg_out*wt_aa_one_hot).sum(-1)
-            ddg = ddg_out_aa - ddg_out_wt_aa
-            return ddg.reshape(-1,20)
+            return residue_scores
 
-        batch['mut_ids'] = batch['mut_ids'] if isinstance(batch['mut_ids'], torch.Tensor) else torch.tensor(batch['mut_ids'])
-        shifed_mut_ids = batch['mut_ids'].to(representation.device)+1
-        muted_id_representation = representation[:, shifed_mut_ids.long()] # [B, H]
-        batch['muted_id_representation'] = muted_id_representation
-        pre_output = self.mlp(batch)
-        
-        ddg_out = pre_output.squeeze()
-        
-        ddg_out_aa = (ddg_out*batch['append_tensors'][:,21:]).sum(-1)
-        ddg_out_wt_aa = (ddg_out*batch['append_tensors'][:,:21]).sum(-1)
-        ddg = ddg_out_aa - ddg_out_wt_aa
-        ddg[torch.isnan(ddg)] = 10000
-        
-        return ddg
+        mut_pos = batch['mut_pos'].to(residue_scores.device)
+        wt_aa_id = batch['wt_aa_id'].to(residue_scores.device)
+        mut_aa_id = batch['mut_aa_id'].to(residue_scores.device)
+
+        if mut_pos.dim() == 1:
+            if residue_scores.size(0) == 1:
+                mut_pos = mut_pos.unsqueeze(0)
+                wt_aa_id = wt_aa_id.unsqueeze(0)
+                mut_aa_id = mut_aa_id.unsqueeze(0)
+            elif mut_pos.size(0) == residue_scores.size(0):
+                mut_pos = mut_pos.unsqueeze(-1)
+                wt_aa_id = wt_aa_id.unsqueeze(-1)
+                mut_aa_id = mut_aa_id.unsqueeze(-1)
+
+        batch_idx = torch.arange(residue_scores.size(0), device=residue_scores.device).unsqueeze(-1)
+        score_mut = residue_scores[batch_idx, mut_pos.long(), mut_aa_id.long()]
+        score_wt = residue_scores[batch_idx, mut_pos.long(), wt_aa_id.long()]
+        delta = score_mut - score_wt
+
+        return delta.reshape(-1)
 
     def forward_encoder(self,batch):
         """

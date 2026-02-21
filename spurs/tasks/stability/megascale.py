@@ -114,45 +114,25 @@ class MegaScale(TaskLitModule):
             - lengths: int [bsz, len], protein sequence lengths
             - tokens: LongTensor [bsz, len], sequence of amino acids  
             - mut_ids: LongTensor [bsz], mutation ids 
-            - score_fermis: FloatTensor [bsz], fermi energy scores 
-            - append_tensors: FloatTensor [bsz, 42], appended tensors
+            - ddG_true: FloatTensor [bsz], ground-truth ddG labels
+            - mut_pos / wt_aa_id / mut_aa_id: mutation position and amino-acid ids
                
         """
         pre_ddg = self.model(batch)
-        pre = None
-        if not isinstance(pre_ddg,torch.Tensor):
-            pre_ddg, pre = pre_ddg
-            pre = pre.squeeze()
-            if self.eval_loss1 is None:
-                self.eval_loss1 = MeanMetric().to(self.eval_loss.device)
-                self.eval_loss2 = MeanMetric().to(self.eval_loss.device)
-        if len(pre_ddg.size())==2:
+        if len(pre_ddg.size()) == 2:
             pre_ddg = pre_ddg.squeeze(1)
-        batch['ddG'] = batch['ddG'].reshape(-1)
-        if stage == 'train_val':
-            if self.criterion.__class__.__name__ == 'RANKLoss':
-                loss, logging_output = self.criterion(pre_ddg, batch['ddG'])
-            elif self.criterion.__class__.__name__ == 'BINLoss':
-                # breakpoint()
-                loss, logging_output = self.criterion(pre_ddg,batch['ddG'],batch['loss_type'],batch['std_ratio'],batch['loss_ratio'])
-            elif pre is None:
-                    loss, logging_output = self.criterion(pre_ddg, batch['ddG'])
-            else:
-                loss, logging_output = self.criterion(pre_ddg, batch['ddG'],pre,batch['append_tensors'][:,:21])
-            # log.info(f"Loss: {loss.item()}")
-            if loss>100:
-                breakpoint()
-            return loss, logging_output
-        elif stage == 'test':
-            loss = 0
-            loss, logging_output = self.criterion(pre_ddg, batch['ddG'])
-            assert logging_output['pred_value'].shape==logging_output['y'].shape
+
+        batch['ddG_true'] = batch['ddG_true'].reshape(-1)
+        loss, logging_output = self.criterion(pre_ddg, batch['ddG_true'])
+
+        if stage == 'test':
+            assert logging_output['pred_value'].shape == logging_output['y'].shape
             logging_output = {
                 'pred_value': logging_output['pred_value'],
-                'y': batch['ddG']
+                'y': batch['ddG_true']
             }
 
-            return loss, logging_output
+        return loss, logging_output
 
     def training_step(self, batch: Any, batch_idx: int):
         loss, logging_output = self.step(batch)
@@ -183,8 +163,8 @@ class MegaScale(TaskLitModule):
             self.use_rho_avg = True
         self.fermi_scores.update(logging_output['y'].cpu())
         self.pred_scores.update(logging_output['pred_value'].cpu())
-        self.pdb_chain += [batch['name']]*len(batch['ddG']) if isinstance(batch['name'],str) else batch['name']
-        self.dataset_name += [batch['dataset']]*len(batch['ddG']) if isinstance(batch['dataset'],str) else batch['dataset']
+        self.pdb_chain += [batch['name']]*len(batch['ddG_true']) if isinstance(batch['name'],str) else batch['name']
+        self.dataset_name += [batch['dataset']]*len(batch['ddG_true']) if isinstance(batch['dataset'],str) else batch['dataset']
 
         return {"loss": loss}
 
@@ -257,8 +237,8 @@ class MegaScale(TaskLitModule):
         self.append_tensors.update(batch['append_tensors'])
         if len(self.fermi_scores.compute())!=len(self.pred_scores.compute()):
             breakpoint()
-        self.pdb_chain += [batch['name']]*len(batch['ddG']) if isinstance(batch['name'],str) else batch['name']
-        self.dataset_name += [batch['dataset']]*len(batch['ddG']) if isinstance(batch['dataset'],str) else batch['dataset']
+        self.pdb_chain += [batch['name']]*len(batch['ddG_true']) if isinstance(batch['name'],str) else batch['name']
+        self.dataset_name += [batch['dataset']]*len(batch['ddG_true']) if isinstance(batch['dataset'],str) else batch['dataset']
         
         return {"loss": loss}
 
