@@ -1,44 +1,46 @@
+from dataclasses import dataclass
+
 import torch
-import torch.nn as nn
+from torch import nn
+
+
+@dataclass
+class RewiringAdapterConfig:
+    hidden_dim: int = 1280
+    num_heads: int = 16
+    mlp_ratio: float = 2.0
+    dropout: float = 0.1
 
 
 class RewiringAdapter(nn.Module):
-    """LN -> CrossAttn -> Zero-init out proj -> Residual -> MLP -> Residual."""
+    """SPURS-style residual rewiring block using cross-attention."""
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.1, mlp_ratio: float = 0.5):
+    def __init__(self, cfg: RewiringAdapterConfig):
         super().__init__()
-        self.norm = nn.LayerNorm(embed_dim)
+        self.ln = nn.LayerNorm(cfg.hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=False,
+            embed_dim=cfg.hidden_dim,
+            num_heads=cfg.num_heads,
+            dropout=cfg.dropout,
+            batch_first=True,
         )
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        self.zero_out = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
+        nn.init.zeros_(self.zero_out.weight)
+        nn.init.zeros_(self.zero_out.bias)
 
-        mlp_hidden = max(1, int(embed_dim * mlp_ratio))
+        inner_dim = int(cfg.hidden_dim * cfg.mlp_ratio)
+        self.mlp_ln = nn.LayerNorm(cfg.hidden_dim)
         self.mlp = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, mlp_hidden),
+            nn.Linear(cfg.hidden_dim, inner_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden, embed_dim),
-            nn.Dropout(dropout),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(inner_dim, cfg.hidden_dim),
+            nn.Dropout(cfg.dropout),
         )
 
-    def forward(self, x, context, attn_mask=None, key_padding_mask=None):
-        residual = x
-        x_norm = self.norm(x)
-        attn_out, _ = self.cross_attn(
-            query=x_norm,
-            key=context,
-            value=context,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        x = residual + self.out_proj(attn_out)
-        x = x + self.mlp(x)
-        return x
+    def forward(self, h: torch.Tensor, f_ext: torch.Tensor, key_padding_mask=None) -> torch.Tensor:
+        q = self.ln(h)
+        attn_out, _ = self.cross_attn(q, f_ext, f_ext, key_padding_mask=key_padding_mask, need_weights=False)
+        h_out = h + self.zero_out(attn_out)
+        h_out = h_out + self.mlp(self.mlp_ln(h_out))
+        return h_out
