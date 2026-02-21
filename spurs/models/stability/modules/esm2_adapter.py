@@ -22,6 +22,8 @@ from esm.modules import (
     ESM1bLayerNorm,
     ContactPredictionHead,
 )
+from esm.multihead_attention import MultiheadAttention
+from spurs.models.lora import inject_lora
 from spurs.models.adapters import RewiringAdapter
 from spurs.utils.config import compose_config as Cfg, merge_config
 from spurs import utils
@@ -49,10 +51,44 @@ class ESM2WithStructuralAdatper(nn.Module):
         log.info(f"unexpected keys: {out.unexpected_keys}")
         del pretrained_model
 
-        # freeze pretrained parameters
+        # Freeze all parameters first to avoid accidental full-parameter finetuning.
+        for _, param in model.named_parameters():
+            param.requires_grad = False
+
+        lora_rank = int(getattr(args, 'lora_rank', 8))
+        if lora_rank not in (8, 16):
+            raise ValueError(f"Only LoRA rank 8/16 is supported, got {lora_rank}")
+        target_layers = getattr(args, 'target_layers', [-3, -2, -1])
+        target_modules = getattr(args, 'target_modules', ['q_proj', 'v_proj'])
+        injected_modules = inject_lora(
+            layers=model.layers,
+            rank=lora_rank,
+            target_layers=target_layers,
+            target_modules=target_modules,
+        )
+
+        # Unfreeze only LoRA parameters.
         for pname, param in model.named_parameters():
-            if 'adapter' not in pname:
-                param.requires_grad = False
+            if 'lora_' in pname:
+                param.requires_grad = True
+
+        non_lora_trainables = [n for n, p in model.named_parameters() if p.requires_grad and 'lora_' not in n]
+        if non_lora_trainables:
+            log.warning(f"Found unexpected trainable non-LoRA params: {non_lora_trainables}")
+
+        trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        trainable_param_names = [n for n, _ in trainable_named_params]
+        trainable_param_count = sum(p.numel() for _, p in trainable_named_params)
+        total_param_count = sum(p.numel() for p in model.parameters())
+        trainable_ratio = (trainable_param_count / total_param_count) if total_param_count > 0 else 0.0
+
+        log.info(f"LoRA injected modules: {injected_modules}")
+        log.info(f"Trainable parameter names: {trainable_param_names}")
+        log.info(
+            "Trainable parameter stats: "
+            f"{trainable_param_count}/{total_param_count} ({trainable_ratio:.6%})"
+        )
+
         return model 
 
     def __init__(
@@ -325,3 +361,118 @@ ESM2WithStructuralAdatper = StructuralAdapterStack
 
     def predict_contacts(self, tokens):
         return self(tokens, return_contacts=True)["contacts"]
+
+
+class TransforerLayerWithStructralAdapter(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        ffn_embed_dim,
+        attention_heads,
+        encoder_embed_dim,
+        add_bias_kv=True,
+        use_esm1b_layer_norm=False,
+        use_rotary_embeddings: bool = False,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.ffn_embed_dim = ffn_embed_dim
+        self.attention_heads = attention_heads
+        self.use_rotary_embeddings = use_rotary_embeddings
+
+        self.encoder_embed_dim = encoder_embed_dim
+        self.dropout = dropout
+        self._init_submodules(add_bias_kv, use_esm1b_layer_norm)
+        self.use_adapter = True
+
+
+    def _init_submodules(self, add_bias_kv, use_esm1b_layer_norm):
+        BertLayerNorm = ESM1bLayerNorm if use_esm1b_layer_norm else ESM1LayerNorm
+
+        self.self_attn = MultiheadAttention(
+            self.embed_dim,
+            self.attention_heads,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=False,
+            use_rotary_embeddings=self.use_rotary_embeddings,
+        )
+        self.self_attn_layer_norm = BertLayerNorm(self.embed_dim)
+
+        self.fc1 = nn.Linear(self.embed_dim, self.ffn_embed_dim)
+        self.fc2 = nn.Linear(self.ffn_embed_dim, self.embed_dim)
+
+        self.final_layer_norm = BertLayerNorm(self.embed_dim)
+
+        # structural adapter
+        self.structural_adapter_attn = NormalizedResidualBlock(
+            layer=MultiheadAttention(
+                self.embed_dim,
+                self.attention_heads,
+                kdim=self.encoder_embed_dim,
+                vdim=self.encoder_embed_dim,
+                add_bias_kv=add_bias_kv,
+                add_zero_attn=False,
+                use_rotary_embeddings=True,
+            ),
+            embedding_dim=self.embed_dim,
+            dropout=self.dropout
+        )
+        self.structural_adapter_ffn = NormalizedResidualBlock(
+            layer=FeedForwardNetwork(
+                self.embed_dim,
+                self.embed_dim // 2, # NOTE: bottleneck FFN is important
+                # self.ffn_embed_dim,
+                activation_dropout=self.dropout
+            ),
+            embedding_dim=self.embed_dim,
+            dropout=self.dropout
+        )
+
+    def forward(
+        self, x, encoder_out, self_attn_mask=None, self_attn_padding_mask=None, need_head_weights=False
+    ):
+
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        x, attn = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            key_padding_mask=self_attn_padding_mask,
+            need_weights=True,
+            need_head_weights=need_head_weights,
+            attn_mask=self_attn_mask,
+        )
+        x = residual + x
+
+        # x = self.forward_adapter(x, encoder_out, attn_mask=self_attn_mask, attn_padding_mask=self_attn_padding_mask)
+
+        residual = x
+        x = self.final_layer_norm(x)
+        x = gelu(self.fc1(x))
+        x = self.fc2(x)
+        x = residual + x
+        if self.use_adapter:
+            x = x + self.forward_adapter(x, encoder_out, attn_mask=self_attn_mask, attn_padding_mask=self_attn_padding_mask)
+        else:
+
+            assert encoder_out is None
+        return x, attn
+
+    def forward_adapter(self, x, encoder_out, attn_mask, attn_padding_mask):
+        encoder_feats = encoder_out['feats']
+        encoder_feats = encoder_feats.transpose(0, 1)
+
+        x = self.structural_adapter_attn(
+            x, 
+            key=encoder_feats,
+            value=encoder_feats,
+            key_padding_mask=attn_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=False
+        )[0]
+
+        x = self.structural_adapter_ffn(x)
+        # x = x.transpose(0, 1)
+        return x

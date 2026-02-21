@@ -26,6 +26,9 @@ class SPURSConfig:
     use_lora_last_three_layers: bool = False
     dropout: float = 0.1
     mlp: MLPConfig = field(default=MLPConfig())
+    lora_rank: int = 8
+    target_layers: List = field(default_factory=lambda: [-3, -2, -1])
+    target_modules: List = field(default_factory=lambda: ['q_proj', 'v_proj'])
 
 
 @register_model('spurs')
