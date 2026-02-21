@@ -16,6 +16,7 @@ from spurs import utils
 log = utils.get_logger(__name__)
 import json
 from .LMDBDataset import LMDBDataset
+from spurs.models.saprot_backbone import SaProtDualTokenizer
 from .batch import CoordBatchConverter
 from .data_utils import Alphabet
 from .fireport import FireProtDataset
@@ -263,7 +264,8 @@ class Featurizer(object):
                  coord_nan_to_zero=True,
                  atoms=('N', 'CA', 'C', 'O'),
                  single_mut = False,
-                 mut_seq= False
+                 mut_seq= False,
+                 saprot_lmdb_path: str = "processed_data/saprot_lmdb/wt_mlm_db/"
                  ):
         self.alphabet = alphabet
         self.batcher = CoordBatchConverter(
@@ -276,7 +278,24 @@ class Featurizer(object):
         self.atoms = atoms
         self.cache = defaultdict(lambda: -1)
         self.mut_seq = mut_seq
+        self.saprot_tokenizer = SaProtDualTokenizer()
+        self.saprot_lmdb = None
+        if saprot_lmdb_path and os.path.isdir(saprot_lmdb_path):
+            self.saprot_lmdb = LMDBDataset(path=saprot_lmdb_path, to_dict=True, to_list=False)
 
+
+    def _get_saprot_entry(self, entry):
+        aa_seq = entry['seq']
+        foldseek_seq = '#' * len(aa_seq)
+        mlm_mask = None
+        if self.saprot_lmdb is not None:
+            key = entry.get('name', '')
+            if key in self.saprot_lmdb.lmdb_dict:
+                lmdb_item = self.saprot_lmdb.get_value(key)
+                aa_seq = lmdb_item.get('aa_seq', aa_seq)
+                foldseek_seq = lmdb_item.get('foldseek_seq', foldseek_seq)
+                mlm_mask = lmdb_item.get('mlm_mask_positions', None)
+        return {'aa_seq': aa_seq, 'foldseek_seq': foldseek_seq, 'mlm_mask': mlm_mask}
 
     def __call__(self, raw_batch: dict):
         
@@ -303,6 +322,16 @@ class Featurizer(object):
             raw_batch['ddG'] = raw_batch['ddG'].reshape(-1)
             raw_batch['ddG_true'] = raw_batch['ddG_true'].reshape(-1)
 
+            saprot_meta = self._get_saprot_entry(raw_batch)
+            raw_batch['saprot_aa_seq'] = saprot_meta['aa_seq']
+            raw_batch['saprot_foldseek_seq'] = saprot_meta['foldseek_seq']
+            raw_batch['saprot_mlm_mask'] = saprot_meta['mlm_mask']
+            raw_batch['saprot_tokens'] = self.saprot_tokenizer.batch_encode(
+                [saprot_meta['aa_seq']],
+                [saprot_meta['foldseek_seq']],
+                [saprot_meta['mlm_mask']],
+            )
+
             return raw_batch
             
 
@@ -326,6 +355,8 @@ class Featurizer(object):
             protein['mut_tokens'] = None  
         
         ddg = torch.stack([protein['ddG'] for protein in raw_batch])
+        aa_seqs = [protein['seq'] for protein in raw_batch]
+        saprot_tokens = self.saprot_tokenizer.batch_encode(aa_seqs)
         return {
             'raw_batch': raw_batch,
             'mut_ids': [protein['mut_ids'] for protein in raw_batch],
@@ -337,6 +368,10 @@ class Featurizer(object):
             'ddG_true': torch.stack([protein['ddG_true'] for protein in raw_batch]),
             'name': [protein['name']+protein['chain_ids'] for protein in raw_batch],
             'dataset': [protein['dataset'] for protein in raw_batch],
+            'saprot_aa_seq': aa_seqs,
+            'saprot_foldseek_seq': ['#' * len(seq) for seq in aa_seqs],
+            'saprot_mlm_mask': [None for _ in aa_seqs],
+            'saprot_tokens': saprot_tokens,
         }
     
 class MegaScaleTestDatasets(torch.utils.data.Dataset):

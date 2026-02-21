@@ -1,16 +1,17 @@
 from dataclasses import dataclass, field
-from typing import List
-
 import torch
 import torch.nn.functional as F
 from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
 from spurs.models.stability.protein_mpnn import ProteinMPNNConfig
 
-from spurs.models.stability.modules.esm2 import ESM2
 from spurs import utils
 from spurs.models.stability.org_transfer_model import get_protein_mpnn
 from spurs.models.stability.modules.esm2_adapter import ESM2WithStructuralAdatper
+import torch.nn.functional as F
+from spurs.models.stability.modules.esm2_adapter import StructuralAdapterConfig, StructuralAdapterStack
+from spurs.models.saprot_backbone import SaProtBackbone, SaProtConfig
+import torch.nn as nn
 log = utils.get_logger(__name__)
 from .mlp import MLPConfig
 from spurs.models.ddg_head import DDGHead
@@ -19,9 +20,10 @@ from spurs.models.ddg_head import DDGHead
 @dataclass
 class SPURSConfig:
     encoder: ProteinMPNNConfig = field(default=ProteinMPNNConfig())
-    adapter_layer_indices: List = field(default_factory=lambda: [-1, ])
     separate_loss: bool = True
-    name: str = 'esm2_t33_650M_UR50D'
+    saprot_model_name: str = 'westlake-repl/SaProt_650M_AF2'
+    freeze_saprot_backbone: bool = True
+    use_lora_last_three_layers: bool = False
     dropout: float = 0.1
     mlp: MLPConfig = field(default=MLPConfig())
 
@@ -44,7 +46,6 @@ class SPURS(BaseModel):
     Args:
         cfg (SPURSConfig): Configuration object containing model parameters
             - encoder: ProteinMPNN configuration
-            - adapter_layer_indices: List of ESM2 layer indices to adapt
             - name: ESM2 model name
             - dropout: Dropout rate
             - mlp: MLP configuration
@@ -59,7 +60,16 @@ class SPURS(BaseModel):
         self.encoder = get_protein_mpnn(tune=cfg.encoder.tune) 
         
         self.cfg.encoder.d_model = self.cfg.mlp.input_dim
-        self.decoder = ESM2WithStructuralAdatper.from_pretrained(args=self.cfg, name=self.cfg.name)
+        self.decoder = SaProtBackbone(SaProtConfig(
+            model_name=self.cfg.saprot_model_name,
+            freeze_backbone=self.cfg.freeze_saprot_backbone,
+            use_lora_last_three_layers=self.cfg.use_lora_last_three_layers,
+        ))
+        self.structural_adapter = StructuralAdapterStack(StructuralAdapterConfig(
+            embed_dim=1280,
+            encoder_embed_dim=self.cfg.mlp.input_dim,
+            dropout=self.cfg.dropout,
+        ))
         self.input_dim = self.cfg.mlp.input_dim
         self.ddg_head = DDGHead(hidden_dim=1280, out_dim=20)
         
@@ -88,6 +98,26 @@ class SPURS(BaseModel):
         representation = decoder_out['representations'][-1]
         residue_representation = representation[:, 1:-1, :]
         residue_scores = self.ddg_head(residue_representation)
+        base_feats = F.pad(batch['feats'], (0, 0, 1, 1))
+        encoder_out = {
+            'profam': F.pad(batch.get('profam_feats', batch['feats']), (0, 0, 1, 1)),
+            'boltz2': F.pad(batch.get('boltz2_feats', batch['feats']), (0, 0, 1, 1)),
+            'ligandmpnn': F.pad(batch.get('ligandmpnn_feats', batch['feats']), (0, 0, 1, 1)),
+            'feats': base_feats,
+        }
+        
+        init_pred = batch.get('saprot_tokens', batch['tokens'])
+
+        decoder_out = self.decoder(tokens=init_pred)
+        representation = self.structural_adapter(decoder_out['representations'][-1], encoder_out=encoder_out)
+        if self.cfg.mlp.flat_dim > 0:
+        
+            flat_representation = self.flat_layers(representation)
+            flat_representation = self.dp(flat_representation)
+            flat_representation = F.gelu(flat_representation)
+            representation = flat_representation
+        
+        representation = torch.cat([representation, encoder_out['feats']], dim=-1)
 
         if 'return_logist' in kwargs and kwargs['return_logist']:
             return residue_scores

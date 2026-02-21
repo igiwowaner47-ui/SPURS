@@ -6,7 +6,7 @@ import lmdb
 class LMDBDataset(Dataset):
     def __init__(
         self,
-        path,
+        path="processed_data/saprot_lmdb/wt_mlm_db/",
         to_dict = True,
         to_list = True
 ) -> None:
