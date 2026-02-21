@@ -6,11 +6,11 @@ from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
 from spurs.models.stability.protein_mpnn import ProteinMPNNConfig
 
-from spurs.models.stability.modules.esm2 import ESM2
 from spurs import utils
 from spurs.models.stability.org_transfer_model import get_protein_mpnn
 import torch.nn.functional as F
-from spurs.models.stability.modules.esm2_adapter import ESM2WithStructuralAdatper
+from spurs.models.stability.modules.esm2_adapter import StructuralAdapterConfig, StructuralAdapterStack
+from spurs.models.saprot_backbone import SaProtBackbone, SaProtConfig
 import torch.nn as nn
 log = utils.get_logger(__name__)
 from .mlp import MLP, MLPConfig
@@ -21,7 +21,9 @@ class SPURSConfig:
     encoder: ProteinMPNNConfig = field(default=ProteinMPNNConfig())
     adapter_layer_indices: List = field(default_factory=lambda: [-1, ])
     separate_loss: bool = True
-    name: str = 'esm2_t33_650M_UR50D'
+    saprot_model_name: str = 'westlake-repl/SaProt_650M_AF2'
+    freeze_saprot_backbone: bool = True
+    use_lora_last_three_layers: bool = False
     dropout: float = 0.1
     mlp: MLPConfig = field(default=MLPConfig())
 
@@ -59,7 +61,16 @@ class SPURS(BaseModel):
         self.encoder = get_protein_mpnn(tune=cfg.encoder.tune) 
         
         self.cfg.encoder.d_model = self.cfg.mlp.input_dim
-        self.decoder = ESM2WithStructuralAdatper.from_pretrained(args=self.cfg, name=self.cfg.name)
+        self.decoder = SaProtBackbone(SaProtConfig(
+            model_name=self.cfg.saprot_model_name,
+            freeze_backbone=self.cfg.freeze_saprot_backbone,
+            use_lora_last_three_layers=self.cfg.use_lora_last_three_layers,
+        ))
+        self.structural_adapter = StructuralAdapterStack(StructuralAdapterConfig(
+            embed_dim=1280,
+            encoder_embed_dim=self.cfg.mlp.input_dim,
+            dropout=self.cfg.dropout,
+        ))
         self.input_dim = self.cfg.mlp.input_dim
         self.cfg.mlp.input_dim = self.cfg.mlp.input_dim+1280 if self.cfg.mlp.flat_dim < 0 else self.cfg.mlp.input_dim+self.cfg.mlp.flat_dim
 
@@ -86,14 +97,10 @@ class SPURS(BaseModel):
         batch['feats'] = batch['feats'][:,:,:self.input_dim]
         encoder_out = {'feats':F.pad(batch['feats'], (0, 0, 1, 1))}
         
-        init_pred = batch['tokens']
+        init_pred = batch.get('saprot_tokens', batch['tokens'])
 
-        decoder_out = self.decoder(
-            tokens=init_pred,
-            encoder_out=encoder_out,
-        )
-        
-        representation = decoder_out['representations'][-1]
+        decoder_out = self.decoder(tokens=init_pred)
+        representation = self.structural_adapter(decoder_out['representations'][-1], encoder_out=encoder_out)
         if self.cfg.mlp.flat_dim > 0:
         
             flat_representation = self.flat_layers(representation)
