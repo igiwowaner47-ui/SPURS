@@ -465,7 +465,11 @@ def get_pdb(pdb,wt_seq,wt_name, check_assert = True):
         'name': wt_name,
         'chain_ids': chainid,
         'mut_ids': [],
+        'mut_pos': [],
+        'wt_aa_id': [],
+        'mut_aa_id': [],
         'ddG': [],
+        'ddG_true': [],
         'append_tensors':[],
         'mut_seq':[],
     }
