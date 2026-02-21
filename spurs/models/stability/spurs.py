@@ -1,248 +1,86 @@
 from dataclasses import dataclass, field
+
 import torch
-import torch.nn.functional as F
 from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
-from spurs.models.stability.protein_mpnn import ProteinMPNNConfig
 
-from spurs import utils
-from spurs.models.stability.org_transfer_model import get_protein_mpnn
-from spurs.models.stability.modules.esm2_adapter import ESM2WithStructuralAdatper
-import torch.nn.functional as F
-from spurs.models.stability.modules.esm2_adapter import StructuralAdapterConfig, StructuralAdapterStack
-from spurs.models.saprot_backbone import SaProtBackbone, SaProtConfig
-import torch.nn as nn
-from spurs.models.profam_encoder import ProFAMEncoder
-from spurs.models.boltz_encoder import BoltzEncoder
-log = utils.get_logger(__name__)
-from .mlp import MLPConfig
-from spurs.models.ddg_head import DDGHead
+from spurs.models.adapters import RewiringAdapter, RewiringAdapterConfig
+from spurs.models.boltz_encoder import BoltzEncoder, BoltzEncoderConfig
+from spurs.models.ddg_head import DDGHead, DDGHeadConfig, delta_from_logits
+from spurs.models.ligandmpnn_encoder import LigandMPNNEncoder, LigandMPNNEncoderConfig
+from spurs.models.lora import LoRAConfig, apply_lora_to_saprot
+from spurs.models.profam_encoder import ProFamEncoder, ProFamEncoderConfig
+from spurs.models.saprot_backbone import SaProtBackbone, SaProtBackboneConfig
 
 
 @dataclass
 class SPURSConfig:
-    encoder: ProteinMPNNConfig = field(default=ProteinMPNNConfig())
-    separate_loss: bool = True
-    saprot_model_name: str = 'westlake-repl/SaProt_650M_AF2'
-    freeze_saprot_backbone: bool = True
-    use_lora_last_three_layers: bool = False
-    dropout: float = 0.1
-    mlp: MLPConfig = field(default=MLPConfig())
-    lora_rank: int = 8
-    target_layers: List = field(default_factory=lambda: [-3, -2, -1])
-    target_modules: List = field(default_factory=lambda: ['q_proj', 'v_proj'])
+    saprot: SaProtBackboneConfig = field(default_factory=SaProtBackboneConfig)
+    ligandmpnn: LigandMPNNEncoderConfig = field(default_factory=LigandMPNNEncoderConfig)
+    profam: ProFamEncoderConfig = field(default_factory=ProFamEncoderConfig)
+    boltz: BoltzEncoderConfig = field(default_factory=BoltzEncoderConfig)
+    adapter: RewiringAdapterConfig = field(default_factory=RewiringAdapterConfig)
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
+    ddg_head: DDGHeadConfig = field(default_factory=DDGHeadConfig)
 
 
 @register_model('spurs')
 class SPURS(BaseModel):
-    """
-    SPURS (Structure-based Protein Understanding and Recognition System) model for protein stability prediction.
-    
-    This model combines protein structure information (from ProteinMPNN) and sequence information (from ESM2)
-    to predict protein stability changes. The architecture consists of three main components:
-    
-    1. Encoder (ProteinMPNN): Processes protein structure information
-    2. Decoder (ESM2): Processes sequence information with structural prior
-    3. MLP: Final stability prediction layer
-    
-    The model uses a structural adapter to effectively combine structural and sequence information,
-    allowing for more accurate stability predictions.
-    
-    Args:
-        cfg (SPURSConfig): Configuration object containing model parameters
-            - encoder: ProteinMPNN configuration
-            - name: ESM2 model name
-            - dropout: Dropout rate
-            - mlp: MLP configuration
-    """
     _default_cfg = SPURSConfig()
 
     def __init__(self, cfg) -> None:
         super().__init__(cfg)
+        self.backbone = SaProtBackbone(self.cfg.saprot)
+        self.profam_encoder = ProFamEncoder(self.cfg.profam)
+        self.boltz_encoder = BoltzEncoder(self.cfg.boltz)
+        self.ligand_encoder = LigandMPNNEncoder(self.cfg.ligandmpnn)
 
-        self.tune = cfg.encoder.tune
-        self.use_input_decoding_order = cfg.encoder.use_input_decoding_order
-        self.encoder = get_protein_mpnn(tune=cfg.encoder.tune) 
-        
-        self.cfg.encoder.d_model = self.cfg.mlp.input_dim
-        self.decoder = SaProtBackbone(SaProtConfig(
-            model_name=self.cfg.saprot_model_name,
-            freeze_backbone=self.cfg.freeze_saprot_backbone,
-            use_lora_last_three_layers=self.cfg.use_lora_last_three_layers,
-        ))
-        self.structural_adapter = StructuralAdapterStack(StructuralAdapterConfig(
-            embed_dim=1280,
-            encoder_embed_dim=self.cfg.mlp.input_dim,
-            dropout=self.cfg.dropout,
-        ))
-        self.input_dim = self.cfg.mlp.input_dim
-        self.profam_encoder = ProFAMEncoder(out_dim=1280)
-        self.boltz_encoder = BoltzEncoder(out_dim=1280)
-        self.geo_projector = nn.Linear(self.input_dim, 1280)
-        self.cfg.mlp.input_dim = self.cfg.mlp.input_dim+1280 if self.cfg.mlp.flat_dim < 0 else self.cfg.mlp.input_dim+self.cfg.mlp.flat_dim
+        self.adapter_l_minus_2 = RewiringAdapter(self.cfg.adapter)
+        self.adapter_l_minus_1 = RewiringAdapter(self.cfg.adapter)
+        self.adapter_l = RewiringAdapter(self.cfg.adapter)
 
-        self.mlp = MLP(self.cfg.mlp)
-            
+        self.ddg_head = DDGHead(self.cfg.ddg_head)
 
+        apply_lora_to_saprot(self.backbone, self.cfg.lora)
 
-        if self.cfg.mlp.flat_dim > 0:
-            self.flat_layers = nn.Linear(1280, self.cfg.mlp.flat_dim)
-            self.dp = nn.Dropout(self.cfg.dropout)
-        self.ddg_head = DDGHead(hidden_dim=1280, out_dim=20)
-        
-        self.padding_idx = self.decoder.padding_idx
-        self.mask_idx = self.decoder.mask_idx
-        self.cls_idx = self.decoder.cls_idx
-        self.eos_idx = self.decoder.eos_idx
+    def _extract_wt_mut(self, batch, device):
+        if 'wt_aa_id' in batch and 'mut_aa_id' in batch:
+            return batch['wt_aa_id'].to(device), batch['mut_aa_id'].to(device)
 
-    @staticmethod
-    def _align_to_mask(feats: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Ensure [B, N, D] features strictly align to valid token positions in mask."""
-        if feats is None:
-            return None
-        if mask is None:
-            return feats
+        append = batch['append_tensors'].to(device)
+        if append.dim() == 1:
+            append = append.unsqueeze(0)
+        wt_aa = torch.argmax(append[:, :21], dim=-1).clamp_max(19)
+        mut_aa = torch.argmax(append[:, 21:], dim=-1).clamp_max(19)
+        return wt_aa, mut_aa
 
-        B, N = mask.shape
-        D = feats.shape[-1]
-        aligned = feats.new_zeros((B, N, D))
-
-        for b in range(B):
-            valid_idx = torch.where(mask[b] > 0)[0]
-            take_n = min(valid_idx.numel(), feats.shape[1])
-            if take_n > 0:
-                aligned[b, valid_idx[:take_n]] = feats[b, :take_n]
-        return aligned
-        
     def forward(self, batch, **kwargs):
-        if not self.tune:
-            with torch.no_grad():
-                batch['feats'] = self.forward_encoder(batch)
-        else:   
-            batch['feats'] = self.forward_encoder(batch)
-        
-        batch['feats'] = batch['feats'][:,:,:self.input_dim]
+        aa_tokens = batch['tokens'].long()
+        foldseek_tokens = batch.get('foldseek_tokens', torch.zeros_like(aa_tokens)).long().to(aa_tokens.device)
 
-        # v6 encoder order: ProFAM -> Boltz -> Geo.
-        geo_feats = self._align_to_mask(batch['feats'], batch.get('mask', None))
+        f_profam = self.profam_encoder(aa_tokens)
+        f_boltz = self.boltz_encoder(batch, aa_tokens.shape[1], aa_tokens.device)
+        f_geo = self.ligand_encoder(batch)
 
-        profam_forward = batch.get('profam_forward', None)
-        if profam_forward is None:
-            profam_forward = batch.get('profam_repr', geo_feats)
-        profam_reverse = batch.get('profam_reverse', None)
-        F_profam_1280 = self.profam_encoder(
-            self._align_to_mask(profam_forward, batch.get('mask', None)),
-            None if profam_reverse is None else self._align_to_mask(profam_reverse, batch.get('mask', None)),
-            batch.get('mask', None),
-        )
-
-        boltz_source = batch.get('boltz_single_repr', None)
-        if boltz_source is None:
-            boltz_source = batch.get('boltz_output', None)
-        if boltz_source is None and 'boltz_model' in batch:
-            boltz_source = batch['boltz_model']
-            boltz_inputs = batch.get('boltz_inputs', None)
-            F_boltz_1280 = self.boltz_encoder(boltz_source, boltz_inputs)
-        elif boltz_source is not None:
-            F_boltz_1280 = self.boltz_encoder(boltz_source)
-        else:
-            F_boltz_1280 = geo_feats.new_zeros((geo_feats.shape[0], geo_feats.shape[1], 1280))
-        F_boltz_1280 = self._align_to_mask(F_boltz_1280, batch.get('mask', None))
-
-        F_geo_proj = self.geo_projector(geo_feats)
-
-        batch['F_profam_1280'] = F_profam_1280
-        batch['F_boltz_1280'] = F_boltz_1280
-        batch['F_geo_proj'] = F_geo_proj
-
-        encoder_out = {'feats':F.pad(geo_feats, (0, 0, 1, 1))}
-        
-        init_pred = batch['tokens']
-
-        decoder_out = self.decoder(
-            tokens=init_pred,
-            encoder_out=encoder_out,
-        )
-        
-        representation = decoder_out['representations'][-1]
-        residue_representation = representation[:, 1:-1, :]
-        residue_scores = self.ddg_head(residue_representation)
-        base_feats = F.pad(batch['feats'], (0, 0, 1, 1))
-        encoder_out = {
-            'profam': F.pad(batch.get('profam_feats', batch['feats']), (0, 0, 1, 1)),
-            'boltz2': F.pad(batch.get('boltz2_feats', batch['feats']), (0, 0, 1, 1)),
-            'ligandmpnn': F.pad(batch.get('ligandmpnn_feats', batch['feats']), (0, 0, 1, 1)),
-            'feats': base_feats,
+        l = len(self.backbone.layers)
+        adapter_by_layer = {
+            l - 3: (self.adapter_l_minus_2, f_profam),
+            l - 2: (self.adapter_l_minus_1, f_boltz),
+            l - 1: (self.adapter_l, f_geo),
         }
-        
-        init_pred = batch.get('saprot_tokens', batch['tokens'])
 
-        decoder_out = self.decoder(tokens=init_pred)
-        representation = self.structural_adapter(decoder_out['representations'][-1], encoder_out=encoder_out)
-        if self.cfg.mlp.flat_dim > 0:
-        
-            flat_representation = self.flat_layers(representation)
-            flat_representation = self.dp(flat_representation)
-            flat_representation = F.gelu(flat_representation)
-            representation = flat_representation
-        
-        representation = torch.cat([representation, encoder_out['feats']], dim=-1)
+        outputs = self.backbone(
+            aa_tokens=aa_tokens,
+            foldseek_tokens=foldseek_tokens,
+            adapter_by_layer=adapter_by_layer,
+            token_mask=batch.get('mask', None),
+        )
+        logits = self.ddg_head(outputs['last_hidden_state'])
 
-        if 'return_logist' in kwargs and kwargs['return_logist']:
-            return residue_scores
+        mut_pos = batch['mut_ids'] if isinstance(batch['mut_ids'], torch.Tensor) else torch.tensor(batch['mut_ids'])
+        mut_pos = mut_pos.to(logits.device).long()
+        wt_aa, mut_aa = self._extract_wt_mut(batch, logits.device)
 
-        mut_pos = batch['mut_pos'].to(residue_scores.device)
-        wt_aa_id = batch['wt_aa_id'].to(residue_scores.device)
-        mut_aa_id = batch['mut_aa_id'].to(residue_scores.device)
-
-        if mut_pos.dim() == 1:
-            if residue_scores.size(0) == 1:
-                mut_pos = mut_pos.unsqueeze(0)
-                wt_aa_id = wt_aa_id.unsqueeze(0)
-                mut_aa_id = mut_aa_id.unsqueeze(0)
-            elif mut_pos.size(0) == residue_scores.size(0):
-                mut_pos = mut_pos.unsqueeze(-1)
-                wt_aa_id = wt_aa_id.unsqueeze(-1)
-                mut_aa_id = mut_aa_id.unsqueeze(-1)
-
-        batch_idx = torch.arange(residue_scores.size(0), device=residue_scores.device).unsqueeze(-1)
-        score_mut = residue_scores[batch_idx, mut_pos.long(), mut_aa_id.long()]
-        score_wt = residue_scores[batch_idx, mut_pos.long(), wt_aa_id.long()]
-        delta = score_mut - score_wt
-
-        return delta.reshape(-1)
-
-    def forward_encoder(self,batch):
-        """
-        Forward pass through the encoder (ProteinMPNN) component of the SPURS model.
-        
-        This function processes the input protein structure data (X, S, mask, chain_M, residue_idx, chain_encoding_all, randn_1)
-        and returns the encoded features from the ProteinMPNN encoder.
-
-        Args:
-            batch (dict): Input batch containing protein structure data
-                - X: Protein structure coordinates
-                - S: Protein structure mask
-                - mask: Mask indicating valid positions
-                - chain_M: Chain mask
-                - residue_idx: Residue indices
-                - chain_encoding_all: Chain encoding
-        
-        Returns:
-            torch.Tensor: Encoded features from the ProteinMPNN encoder     
-        """
-
-        
-        X = batch['X']
-        S = batch['S']
-        mask = batch['mask']
-        chain_M = batch['chain_M']
-        chain_M_chain_M_pos = batch['chain_M_chain_M_pos']
-        residue_idx = batch['residue_idx']
-        chain_encoding_all = batch['chain_encoding_all']
-        randn_1 = batch['randn_1']
-        all_mpnn_hid, mpnn_embed, _ = self.encoder(X, S, mask, chain_M, residue_idx, chain_encoding_all, None,self.use_input_decoding_order)
-        
-        all_mpnn_hid = torch.cat([all_mpnn_hid[0],mpnn_embed,all_mpnn_hid[1],all_mpnn_hid[2]],dim=-1)
-        
-        return all_mpnn_hid
+        delta = delta_from_logits(logits, mut_pos, wt_aa.long(), mut_aa.long())
+        delta[torch.isnan(delta)] = 10000
+        return delta

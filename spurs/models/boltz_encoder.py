@@ -1,36 +1,25 @@
+from dataclasses import dataclass
+
 import torch
-import torch.nn as nn
+from torch import nn
+
+
+@dataclass
+class BoltzEncoderConfig:
+    input_dim: int = 256
 
 
 class BoltzEncoder(nn.Module):
-    """Extract Boltz single representation S and project to 1280 dims."""
-
-    def __init__(self, out_dim: int = 1280):
+    def __init__(self, cfg: BoltzEncoderConfig):
         super().__init__()
-        self.proj = nn.LazyLinear(out_dim)
+        self.proj = nn.Linear(cfg.input_dim, 1280)
 
-    def _extract_single(self, boltz_out):
-        if isinstance(boltz_out, torch.Tensor):
-            return boltz_out
-        if isinstance(boltz_out, dict):
-            for key in ("single_repr", "single", "S"):
-                if key in boltz_out:
-                    return boltz_out[key]
-        raise ValueError("Boltz output must contain single representation S [B,N,d_boltz].")
-
-    def forward(self, boltz_model_or_repr, model_inputs=None):
+    def forward(self, batch: dict, seq_len: int, device: torch.device) -> torch.Tensor:
         with torch.no_grad():
-            if isinstance(boltz_model_or_repr, torch.Tensor) or isinstance(boltz_model_or_repr, dict):
-                single_repr = self._extract_single(boltz_model_or_repr)
+            s = batch.get('boltz_single')
+            if s is None:
+                b = batch['tokens'].shape[0]
+                s = torch.zeros(b, seq_len, self.proj.in_features, device=device)
             else:
-                if model_inputs is None:
-                    boltz_out = boltz_model_or_repr()
-                elif isinstance(model_inputs, dict):
-                    boltz_out = boltz_model_or_repr(**model_inputs)
-                elif isinstance(model_inputs, (tuple, list)):
-                    boltz_out = boltz_model_or_repr(*model_inputs)
-                else:
-                    boltz_out = boltz_model_or_repr(model_inputs)
-                single_repr = self._extract_single(boltz_out)
-
-        return self.proj(single_repr)
+                s = s.to(device)
+        return self.proj(s)
