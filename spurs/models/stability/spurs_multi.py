@@ -1,6 +1,4 @@
 from dataclasses import dataclass, field
-from typing import List
-
 import torch
 from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
@@ -21,7 +19,6 @@ log = utils.get_logger(__name__)
 @dataclass
 class SPURSMultiConfig:
     encoder: ProteinMPNNConfig = field(default=ProteinMPNNConfig())
-    adapter_layer_indices: List = field(default_factory=lambda: [-1, ])
     separate_loss: bool = True
     saprot_model_name: str = 'westlake-repl/SaProt_650M_AF2'
     freeze_saprot_backbone: bool = True
@@ -82,7 +79,13 @@ class SPURSMulti(BaseModel):
         batch['feats'] = self.forward_encoder(batch)
 
         batch['feats'] = batch['feats'][:,:,:self.input_dim]
-        encoder_out = {'feats':F.pad(batch['feats'], (0, 0, 1, 1))}
+        base_feats = F.pad(batch['feats'], (0, 0, 1, 1))
+        encoder_out = {
+            'profam': F.pad(batch.get('profam_feats', batch['feats']), (0, 0, 1, 1)),
+            'boltz2': F.pad(batch.get('boltz2_feats', batch['feats']), (0, 0, 1, 1)),
+            'ligandmpnn': F.pad(batch.get('ligandmpnn_feats', batch['feats']), (0, 0, 1, 1)),
+            'feats': base_feats,
+        }
         
         init_pred = batch.get('saprot_tokens', batch['tokens'])
         # need to rethink

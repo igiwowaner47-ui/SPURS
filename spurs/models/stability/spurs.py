@@ -1,6 +1,4 @@
 from dataclasses import dataclass, field
-from typing import List
-
 import torch
 from spurs.models import register_model
 from spurs.models.stability.basemodel import BaseModel
@@ -19,7 +17,6 @@ from .mlp import MLP, MLPConfig
 @dataclass
 class SPURSConfig:
     encoder: ProteinMPNNConfig = field(default=ProteinMPNNConfig())
-    adapter_layer_indices: List = field(default_factory=lambda: [-1, ])
     separate_loss: bool = True
     saprot_model_name: str = 'westlake-repl/SaProt_650M_AF2'
     freeze_saprot_backbone: bool = True
@@ -46,7 +43,6 @@ class SPURS(BaseModel):
     Args:
         cfg (SPURSConfig): Configuration object containing model parameters
             - encoder: ProteinMPNN configuration
-            - adapter_layer_indices: List of ESM2 layer indices to adapt
             - name: ESM2 model name
             - dropout: Dropout rate
             - mlp: MLP configuration
@@ -95,7 +91,13 @@ class SPURS(BaseModel):
             batch['feats'] = self.forward_encoder(batch)
         
         batch['feats'] = batch['feats'][:,:,:self.input_dim]
-        encoder_out = {'feats':F.pad(batch['feats'], (0, 0, 1, 1))}
+        base_feats = F.pad(batch['feats'], (0, 0, 1, 1))
+        encoder_out = {
+            'profam': F.pad(batch.get('profam_feats', batch['feats']), (0, 0, 1, 1)),
+            'boltz2': F.pad(batch.get('boltz2_feats', batch['feats']), (0, 0, 1, 1)),
+            'ligandmpnn': F.pad(batch.get('ligandmpnn_feats', batch['feats']), (0, 0, 1, 1)),
+            'feats': base_feats,
+        }
         
         init_pred = batch.get('saprot_tokens', batch['tokens'])
 
