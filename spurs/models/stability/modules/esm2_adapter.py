@@ -1,3 +1,8 @@
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.nn as nn
 # https://github.com/BytedProtein/ByProt/blob/dd279dc85f76ee2c28c819b71bf3911b90159f0a/src/byprot/models/fixedbb/lm_design/modules/esm2_adapter.py
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
@@ -211,20 +216,65 @@ class ESM2WithStructuralAdatper(nn.Module):
             mask_ratio_observed = (tokens == self.mask_idx).sum(-1).to(x.dtype) / src_lengths
             x = x * (1 - mask_ratio_train) / (1 - mask_ratio_observed)[:, None, None]
 
-        if padding_mask is not None:
-            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
 
-        repr_layers = set(repr_layers)
-        hidden_representations = {}
-        if 0 in repr_layers:
-            hidden_representations[0] = x
+@dataclass
+class StructuralAdapterConfig:
+    embed_dim: int = 1280
+    encoder_embed_dim: int = 128
+    attention_heads: int = 8
+    dropout: float = 0.1
 
-        if need_head_weights:
-            attn_weights = []
 
-        # (B, T, E) => (T, B, E)
-        x = x.transpose(0, 1)
+class StructuralAdapterLayer(nn.Module):
+    """Reusable structural adapter independent from ESM-specific classes."""
 
+    def __init__(self, cfg: StructuralAdapterConfig):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(cfg.embed_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.attention_heads,
+            kdim=cfg.encoder_embed_dim,
+            vdim=cfg.encoder_embed_dim,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(cfg.embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(cfg.embed_dim, cfg.embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.embed_dim // 2, cfg.embed_dim),
+        )
+
+    def forward(self, hidden_states: torch.Tensor, encoder_feats: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.norm1(hidden_states)
+        attn_out, _ = self.cross_attn(
+            query=x,
+            key=encoder_feats,
+            value=encoder_feats,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = hidden_states + attn_out
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class StructuralAdapterStack(nn.Module):
+    def __init__(self, cfg: StructuralAdapterConfig):
+        super().__init__()
+        self.layer = StructuralAdapterLayer(cfg)
+
+    def forward(self, hidden_states: torch.Tensor, encoder_out: Optional[dict] = None) -> torch.Tensor:
+        if encoder_out is None or 'feats' not in encoder_out:
+            return hidden_states
+        encoder_feats = encoder_out['feats']
+        return self.layer(hidden_states, encoder_feats)
+
+
+# backward-compatible alias used by existing imports
+ESM2WithStructuralAdatper = StructuralAdapterStack
         if not padding_mask.any():
             padding_mask = None
 
