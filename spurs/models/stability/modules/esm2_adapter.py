@@ -27,6 +27,7 @@ from esm.modules import (
     gelu,
 )
 from esm.multihead_attention import MultiheadAttention
+from spurs.models.lora import inject_lora
 from spurs.utils.config import compose_config as Cfg, merge_config
 from spurs import utils
 log = utils.get_logger(__name__)
@@ -58,10 +59,44 @@ class ESM2WithStructuralAdatper(nn.Module):
         log.info(f"unexpected keys: {out.unexpected_keys}")
         del pretrained_model
 
-        # freeze pretrained parameters
+        # Freeze all parameters first to avoid accidental full-parameter finetuning.
+        for _, param in model.named_parameters():
+            param.requires_grad = False
+
+        lora_rank = int(getattr(args, 'lora_rank', 8))
+        if lora_rank not in (8, 16):
+            raise ValueError(f"Only LoRA rank 8/16 is supported, got {lora_rank}")
+        target_layers = getattr(args, 'target_layers', [-3, -2, -1])
+        target_modules = getattr(args, 'target_modules', ['q_proj', 'v_proj'])
+        injected_modules = inject_lora(
+            layers=model.layers,
+            rank=lora_rank,
+            target_layers=target_layers,
+            target_modules=target_modules,
+        )
+
+        # Unfreeze only LoRA parameters.
         for pname, param in model.named_parameters():
-            if 'adapter' not in pname:
-                param.requires_grad = False
+            if 'lora_' in pname:
+                param.requires_grad = True
+
+        non_lora_trainables = [n for n, p in model.named_parameters() if p.requires_grad and 'lora_' not in n]
+        if non_lora_trainables:
+            log.warning(f"Found unexpected trainable non-LoRA params: {non_lora_trainables}")
+
+        trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        trainable_param_names = [n for n, _ in trainable_named_params]
+        trainable_param_count = sum(p.numel() for _, p in trainable_named_params)
+        total_param_count = sum(p.numel() for p in model.parameters())
+        trainable_ratio = (trainable_param_count / total_param_count) if total_param_count > 0 else 0.0
+
+        log.info(f"LoRA injected modules: {injected_modules}")
+        log.info(f"Trainable parameter names: {trainable_param_names}")
+        log.info(
+            "Trainable parameter stats: "
+            f"{trainable_param_count}/{total_param_count} ({trainable_ratio:.6%})"
+        )
+
         return model 
 
     def __init__(
