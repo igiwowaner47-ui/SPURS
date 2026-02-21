@@ -1,3 +1,8 @@
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.nn as nn
 # https://github.com/BytedProtein/ByProt/blob/dd279dc85f76ee2c28c819b71bf3911b90159f0a/src/byprot/models/fixedbb/lm_design/modules/esm2_adapter.py
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
@@ -5,33 +10,29 @@
 # LICENSE file in the root directory of this source tree.
 
 from copy import deepcopy
-import math
 from typing import Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from omegaconf import OmegaConf
 
 import esm
 from esm.modules import (
     TransformerLayer,
-    LearnedPositionalEmbedding,
-    SinusoidalPositionalEmbedding,
     RobertaLMHead,
     ESM1bLayerNorm,
     ContactPredictionHead,
-    ESM1LayerNorm,
-    FeedForwardNetwork,
-    NormalizedResidualBlock,
-    gelu,
 )
 from esm.multihead_attention import MultiheadAttention
+from spurs.models.lora import inject_lora
+from spurs.models.adapters import RewiringAdapter
 from spurs.utils.config import compose_config as Cfg, merge_config
 from spurs import utils
 log = utils.get_logger(__name__)
 
 class ESM2WithStructuralAdatper(nn.Module):
+    EXTERNAL_DIM = 1280
+    ADAPTER_STREAM_ORDER = ("profam", "boltz2", "ligandmpnn")
+
     @classmethod
     def from_pretrained(cls, args, override_args=None, name='esm2_t33_650M_UR50D'):
         import esm
@@ -44,24 +45,50 @@ class ESM2WithStructuralAdatper(nn.Module):
             token_dropout=pretrained_model.token_dropout, 
         )
         args = merge_config(pretrained_args, args)
-        # args.adapter_layer_indices = getattr(args, 'adapter_layer_indices', [6, 20, 32])
-
-        args.adapter_layer_indices = args.adapter_layer_indices
-        args.adapter_layer_indices = list(
-            map(lambda x: (args.num_layers + x) % args.num_layers, 
-                args.adapter_layer_indices)
-        )
-
         model = cls(args, deepcopy(alphabet)) 
         out = model.load_state_dict(pretrained_model.state_dict(), strict=False)        
         log.info(f"missing keys: {out.missing_keys}")
         log.info(f"unexpected keys: {out.unexpected_keys}")
         del pretrained_model
 
-        # freeze pretrained parameters
+        # Freeze all parameters first to avoid accidental full-parameter finetuning.
+        for _, param in model.named_parameters():
+            param.requires_grad = False
+
+        lora_rank = int(getattr(args, 'lora_rank', 8))
+        if lora_rank not in (8, 16):
+            raise ValueError(f"Only LoRA rank 8/16 is supported, got {lora_rank}")
+        target_layers = getattr(args, 'target_layers', [-3, -2, -1])
+        target_modules = getattr(args, 'target_modules', ['q_proj', 'v_proj'])
+        injected_modules = inject_lora(
+            layers=model.layers,
+            rank=lora_rank,
+            target_layers=target_layers,
+            target_modules=target_modules,
+        )
+
+        # Unfreeze only LoRA parameters.
         for pname, param in model.named_parameters():
-            if 'adapter' not in pname:
-                param.requires_grad = False
+            if 'lora_' in pname:
+                param.requires_grad = True
+
+        non_lora_trainables = [n for n, p in model.named_parameters() if p.requires_grad and 'lora_' not in n]
+        if non_lora_trainables:
+            log.warning(f"Found unexpected trainable non-LoRA params: {non_lora_trainables}")
+
+        trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        trainable_param_names = [n for n, _ in trainable_named_params]
+        trainable_param_count = sum(p.numel() for _, p in trainable_named_params)
+        total_param_count = sum(p.numel() for p in model.parameters())
+        trainable_ratio = (trainable_param_count / total_param_count) if total_param_count > 0 else 0.0
+
+        log.info(f"LoRA injected modules: {injected_modules}")
+        log.info(f"Trainable parameter names: {trainable_param_names}")
+        log.info(
+            "Trainable parameter stats: "
+            f"{trainable_param_count}/{total_param_count} ({trainable_ratio:.6%})"
+        )
+
         return model 
 
     def __init__(
@@ -115,6 +142,28 @@ class ESM2WithStructuralAdatper(nn.Module):
             ]
         )
 
+        self.adapter_layer_to_stream = {
+            self.num_layers - 3: "profam",
+            self.num_layers - 2: "boltz2",
+            self.num_layers - 1: "ligandmpnn",
+        }
+        self.rewiring_adapters = nn.ModuleDict(
+            {
+                stream: RewiringAdapter(
+                    embed_dim=self.embed_dim,
+                    num_heads=self.attention_heads,
+                    dropout=self.args.dropout,
+                )
+                for stream in self.ADAPTER_STREAM_ORDER
+            }
+        )
+        self.feature_projs = nn.ModuleDict(
+            {
+                stream: nn.LazyLinear(self.EXTERNAL_DIM)
+                for stream in self.ADAPTER_STREAM_ORDER
+            }
+        )
+
         self.contact_head = ContactPredictionHead(
             self.num_layers * self.attention_heads,
             self.prepend_bos,
@@ -133,37 +182,49 @@ class ESM2WithStructuralAdatper(nn.Module):
         self.lm_head.eval()
 
     def _init_layer(self, layer_idx):
-        if layer_idx in self.args.adapter_layer_indices:
-            layer = TransforerLayerWithStructralAdapter(
-                self.embed_dim,
-                4 * self.embed_dim,
-                self.attention_heads,
-                add_bias_kv=False,
-                use_esm1b_layer_norm=True,
-                use_rotary_embeddings=True,
-                encoder_embed_dim=self.args.encoder.d_model,
-                dropout=self.args.dropout
-            )
-        else:
-            layer = TransformerLayer(
-                self.embed_dim,
-                4 * self.embed_dim,
-                self.attention_heads,
-                add_bias_kv=False,
-                use_esm1b_layer_norm=True,
-                use_rotary_embeddings=True,
-            )
+        layer = TransformerLayer(
+            self.embed_dim,
+            4 * self.embed_dim,
+            self.attention_heads,
+            add_bias_kv=False,
+            use_esm1b_layer_norm=True,
+            use_rotary_embeddings=True,
+        )
         return layer
 
+    def _select_stream_features(self, encoder_out, stream):
+        aliases = {
+            "profam": ["profam", "profam_feats"],
+            "boltz2": ["boltz2", "boltz2_feats"],
+            "ligandmpnn": ["ligandmpnn", "ligandmpnn_feats", "feats"],
+        }
+        for key in aliases[stream]:
+            value = encoder_out.get(key)
+            if value is not None:
+                return value
+        raise KeyError(f"Missing required encoder stream '{stream}' in encoder_out.")
+
+    def _project_stream_features(self, encoder_out):
+        projected = {}
+        for stream in self.ADAPTER_STREAM_ORDER:
+            feats = self._select_stream_features(encoder_out, stream)
+            projected[stream] = self.feature_projs[stream](feats)
+        return projected
+
     def forward_layers(self, x, encoder_out, padding_mask, repr_layers=[], hidden_representations=[], need_head_weights=False, attn_weights=[]):
+        stream_features = self._project_stream_features(encoder_out)
         for layer_idx, layer in enumerate(self.layers):
-            if layer_idx in self.args.adapter_layer_indices:
-                x, attn = layer(
-                    x, encoder_out, self_attn_padding_mask=padding_mask, need_head_weights=need_head_weights
-                )
-            else:
-                x, attn = layer(
-                    x, self_attn_padding_mask=padding_mask, need_head_weights=need_head_weights
+            x, attn = layer(
+                x, self_attn_padding_mask=padding_mask, need_head_weights=need_head_weights
+            )
+            stream = self.adapter_layer_to_stream.get(layer_idx)
+            if stream is not None:
+                adapter_context = stream_features[stream].transpose(0, 1)
+                x = self.rewiring_adapters[stream](
+                    x,
+                    adapter_context,
+                    attn_mask=None,
+                    key_padding_mask=padding_mask,
                 )
             if (layer_idx + 1) in repr_layers:
                 hidden_representations[layer_idx + 1] = x.transpose(0, 1)
@@ -191,20 +252,65 @@ class ESM2WithStructuralAdatper(nn.Module):
             mask_ratio_observed = (tokens == self.mask_idx).sum(-1).to(x.dtype) / src_lengths
             x = x * (1 - mask_ratio_train) / (1 - mask_ratio_observed)[:, None, None]
 
-        if padding_mask is not None:
-            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
 
-        repr_layers = set(repr_layers)
-        hidden_representations = {}
-        if 0 in repr_layers:
-            hidden_representations[0] = x
+@dataclass
+class StructuralAdapterConfig:
+    embed_dim: int = 1280
+    encoder_embed_dim: int = 128
+    attention_heads: int = 8
+    dropout: float = 0.1
 
-        if need_head_weights:
-            attn_weights = []
 
-        # (B, T, E) => (T, B, E)
-        x = x.transpose(0, 1)
+class StructuralAdapterLayer(nn.Module):
+    """Reusable structural adapter independent from ESM-specific classes."""
 
+    def __init__(self, cfg: StructuralAdapterConfig):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(cfg.embed_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.attention_heads,
+            kdim=cfg.encoder_embed_dim,
+            vdim=cfg.encoder_embed_dim,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(cfg.embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(cfg.embed_dim, cfg.embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.embed_dim // 2, cfg.embed_dim),
+        )
+
+    def forward(self, hidden_states: torch.Tensor, encoder_feats: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.norm1(hidden_states)
+        attn_out, _ = self.cross_attn(
+            query=x,
+            key=encoder_feats,
+            value=encoder_feats,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = hidden_states + attn_out
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class StructuralAdapterStack(nn.Module):
+    def __init__(self, cfg: StructuralAdapterConfig):
+        super().__init__()
+        self.layer = StructuralAdapterLayer(cfg)
+
+    def forward(self, hidden_states: torch.Tensor, encoder_out: Optional[dict] = None) -> torch.Tensor:
+        if encoder_out is None or 'feats' not in encoder_out:
+            return hidden_states
+        encoder_feats = encoder_out['feats']
+        return self.layer(hidden_states, encoder_feats)
+
+
+# backward-compatible alias used by existing imports
+ESM2WithStructuralAdatper = StructuralAdapterStack
         if not padding_mask.any():
             padding_mask = None
 
